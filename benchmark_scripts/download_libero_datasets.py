@@ -17,7 +17,7 @@ def parse_args():
     parser.add_argument(
         "--datasets",
         type=str,
-        choices=["all", "libero_goal", "libero_spatial", "libero_object", "libero_100"],
+        choices=["all", "libero_goal", "libero_spatial", "libero_object", "libero_10", "libero_90"],
         default="all",
     )
     parser.add_argument(
@@ -48,11 +48,10 @@ def main():
 
     # If not, download
     download_utils.libero_dataset_download(
-        download_dir=args.download_dir, 
+        download_dir=args.download_dir,
         datasets=args.datasets,
         use_huggingface=args.use_huggingface
     )
-
 
     # wait for 1 second
     time.sleep(1)

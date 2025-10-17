@@ -16,3 +16,6 @@ logs/
 *.mp4
 libero.egg-info/
 .vscode/
+
+# ignore all __pycache__ directories
+**/__pycache__/

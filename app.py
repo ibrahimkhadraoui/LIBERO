@@ -40,6 +40,13 @@ class InitRequest(BaseModel):
     stop_on_done: bool = True
 
 
+class InitResponse(BaseModel):
+    ok: bool
+    env_name: str
+    max_steps: int
+    initial_image: str
+
+
 class Action(BaseModel):
     actions: List[float]
 
@@ -224,6 +231,21 @@ def encode_png_b64(pil_img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def rotate_image(img: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate an image by a given angle.
+
+    Args:
+        img (np.ndarray): The input image as a numpy array.
+        angle (float): The angle to rotate the image.
+
+    Returns:
+        np.ndarray: The rotated image as a numpy array.
+    """
+    pil_img = Image.fromarray(img)
+    rotated = pil_img.rotate(angle)
+    return np.array(rotated)
+
+
 def save_img_to_disk(frame: np.ndarray, step_count: int):
     """Save image frame to disk for debugging.
 
@@ -370,7 +392,7 @@ app = FastAPI(title="LIBERO Minimal Server", version="0.2.0")
 # ==========================
 # Endpoints
 # ==========================
-@app.post("/init")
+@app.post("/libero/init")
 async def init_env(req: InitRequest):
     global ENV, ENV_NAME, TASK_ID, CONFIG, STEP_COUNT
     global DONE, LAST_INFO, TASK_SUITE, EPISODE_IDX
@@ -417,14 +439,19 @@ async def init_env(req: InitRequest):
         _ = ENV.set_init_state(initial_states[EPISODE_IDX])
         # Skip the first 10 steps (the sim drops objects from a high z coordinate)
         skip_steps(ENV, 10)
+        obs = ENV.step([0.0]*7)[0]
+        # Flip the image 180 degrees for correct orientation
+        # LIBERO env camera is upside-down
+        initial_image = rotate_image(obs['agentview_image'], 180)
+        initial_image = encode_png_b64(initial_image)
 
         STEP_COUNT = 0
         DONE = False
         LAST_INFO = None
-    return {"ok": True, "env_name": ENV_NAME, "max_steps": CONFIG["max_steps"]}
+    return {"ok": True, "env_name": ENV_NAME, "max_steps": CONFIG["max_steps"], "initial_image": initial_image}
 
 
-@app.post("/change_env")
+@app.post("/libero/change_env")
 async def change_env(req: InitRequest):
     """Change the environment.
 
@@ -437,7 +464,7 @@ async def change_env(req: InitRequest):
     return await init_env(req)
 
 
-@app.get("/state", response_model=StateResponse)
+@app.get("/libero/state", response_model=StateResponse)
 async def get_state():
     """Get the current state of the environment.
 
@@ -459,7 +486,7 @@ async def get_state():
         )
 
 
-@app.post("/reset/episode")
+@app.post("/libero/reset/episode")
 async def reset_episode(new_cfg: Optional[Dict[str, Any]] = None):
     """Reset the current episode in the environment.
 
@@ -475,7 +502,7 @@ async def reset_episode(new_cfg: Optional[Dict[str, Any]] = None):
     return {"ok": True, "max_steps": CONFIG["max_steps"]}
 
 
-@app.post("/reset/task")
+@app.post("/libero/reset/task")
 async def reset_task(new_cfg: Optional[Dict[str, Any]] = None):
     """Reset the task in the environment.
 
@@ -491,7 +518,7 @@ async def reset_task(new_cfg: Optional[Dict[str, Any]] = None):
     return {"ok": True, "max_steps": CONFIG["max_steps"]}
 
 
-@app.post("/run/step", response_model=EpisodeBatchResponse)
+@app.post("/libero/run/step", response_model=EpisodeBatchResponse)
 async def run_step(req: EpisodeBatchRequest):
     global STEP_COUNT, DONE, LAST_INFO
     images: List[ImageItem] = []
@@ -544,6 +571,9 @@ async def run_step(req: EpisodeBatchRequest):
 
                 if (STEP_COUNT % req.capture_every) == 0:
                     frame = obs['agentview_image']
+                    # Flip the image 180 degrees for correct orientation
+                    # LIBERO env camera is upside-down
+                    frame = rotate_image(frame, 180)
                     save_img_to_disk(frame, STEP_COUNT)
                     images.append(
                         ImageItem(
@@ -568,7 +598,7 @@ async def run_step(req: EpisodeBatchRequest):
         )
 
 
-@app.post("/run/episode", response_model=EpisodeBatchResponse)
+@app.post("/libero/run/episode", response_model=EpisodeBatchResponse)
 async def run_episode(req: StepBatchRequest):
     global STEP_COUNT, DONE, LAST_INFO, EPISODE_IDX
     global CONFIG, ENV_NAME, TASK_ID

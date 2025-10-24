@@ -389,6 +389,12 @@ async def fetch_actions_from_falconvla(instruction: str,
 app = FastAPI(title="LIBERO Minimal Server", version="0.2.0")
 
 
+@app.get("/libero/health")
+async def health():
+    """Simple health check endpoint."""
+    return {"ok": True, "env_initialized": ENV is not None}
+
+
 # ==========================
 # Endpoints
 # ==========================

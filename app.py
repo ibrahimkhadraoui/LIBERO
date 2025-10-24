@@ -73,7 +73,6 @@ class StepBatchResponse(BaseModel):
     images: List[ImageItem]
     rewards: List[float]
     infos: List[Dict[str, Any]]
-    obs: Optional[Dict[str, Any]] = None
     total_steps_taken: int
     step_count: int
     done: bool
@@ -83,7 +82,6 @@ class EpisodeBatchResponse(BaseModel):
     images: List[ImageItem]
     rewards: List[float]
     infos: List[Dict[str, Any]]
-    obs: Optional[Dict[str, Any]] = None
     total_steps_taken: int
     step_count: int
     done: bool
@@ -580,6 +578,7 @@ async def run_episode(req: StepBatchRequest):
 
             if (STEP_COUNT % req.capture_every) == 0:
                 frame = obs['agentview_image']
+                frame = rotate_image(frame, 180)
                 save_img_to_disk(frame, STEP_COUNT)
                 images.append(
                     ImageItem(
@@ -598,7 +597,6 @@ async def run_episode(req: StepBatchRequest):
         images=images,
         rewards=rewards,
         infos=infos,
-        obs=obs,
         total_steps_taken=total_steps_taken,
         step_count=STEP_COUNT,
         done=DONE,

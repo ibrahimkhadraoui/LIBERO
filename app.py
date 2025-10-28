@@ -12,6 +12,7 @@ import os
 import base64
 import io
 import httpx
+import requests
 import numpy as np
 import asyncio
 from PIL import Image
@@ -61,6 +62,9 @@ class StepBatchRequest(BaseModel):
 
 
 class EpisodeBatchRequest(BaseModel):
+    instruction: str
+    horizon: int = Field(1, ge=1)
+    stop_on_done: bool = True
     capture_every: int = Field(1, ge=1)
 
 
@@ -180,8 +184,8 @@ def get_env_args(env_name: str, task_id: int, episode_idx: int) -> Dict[str, Any
 
     env_args = {
         "bddl_file_name": task_bddl_file,
-        "camera_heights": 128,
-        "camera_widths": 128
+        "camera_heights": 480,
+        "camera_widths": 480
     }
     return env_args
 
@@ -330,56 +334,68 @@ async def _apply_reset_common(new_cfg: Optional[Dict[str, Any]] = None,
         EPISODE_IDX = 0
 
 
-async def fetch_actions_from_falconvla(instruction: str,
-                                       obs: Optional[Dict[str, Any]] = None
-                                       ) -> List[List[float]]:
-    """Fetch actions from FalconVLA service.
+class PredictPayload(BaseModel):
+    instruction: str
+    image: str
+    horizon: int
+
+
+class PredictResponse(BaseModel):
+    actions: List[List[float]]
+
+
+def _encode_image_path_to_b64(path: str) -> str:
+    """Encode an image file to a base64 string.
 
     Args:
-        instruction (str): The instruction for the action.
-        obs (Optional[Dict[str, Any]], optional): Observation information for the request. Defaults to None.
+        path (str): Path to the image file.
 
     Returns:
-        List[List[float]]: The predicted action chunk.
+        str: Base64-encoded image string.
     """
-    url = os.getenv("FALCONVLA_URL", "http://localhost:8080/predict")
-    timeout = float(os.getenv("FALCONVLA_TIMEOUT", "1.0"))
-    default_action = [0.0] * 7
+    with open(path, "rb") as f:
+        raw = f.read()
+    b64 = base64.b64encode(raw).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
-    # build image payload if observation contains agent view
-    image_b64 = None
-    if obs is not None:
-        try:
-            frame = obs.get("agentview_image") if isinstance(obs, dict) else None
-            if frame is not None:
-                image_b64 = encode_png_b64(frame)
-        except Exception:
-            image_b64 = None
 
-    payload = {"instruction": instruction, "image": image_b64 or ""}
+DEFAULT_FALCONVLA_URL = os.getenv("FALCONVLA_URL", "http://localhost:8080")
+DEFAULT_FALCONVLA_PREDICT_PATH = "/falconvla/predict"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            r = await client.post(url, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            actions = data.get("actions")
-            # Basic validation / normalization
-            if not actions or not isinstance(actions, list):
-                return [default_action]
-            # If returned a flat numeric action, wrap it
-            if isinstance(actions[0], (int, float)):
-                actions = [actions]
-            # Ensure each action is a list of floats
-            normalized: List[List[float]] = []
-            for a in actions:
-                if isinstance(a, (list, tuple)):
-                    normalized.append([float(x) for x in a])
-                else:
-                    normalized.append([float(a)])
-            return normalized
-        except Exception:
-            return [default_action]
+
+def falconvla_predict(instruction: str, image_path: str = None, image_b64: str = None, horizon: int = 10, falconvla_url: str = None, timeout: float = 2.0) -> List[List[float]]:
+    """Send a prediction request to the FalconVLA API.
+
+    Args:
+        instruction (str): The instruction to be processed.
+        image_path (str, optional): Path to the image file. Defaults to None.
+        image_b64 (str, optional): Base64-encoded image string. Defaults to None.
+        horizon (int, optional): Prediction horizon. Defaults to 10.
+        falconvla_url (str, optional): Base URL for the FalconVLA API. Defaults to None.
+        timeout (float, optional): Timeout for the API request. Defaults to 2.0.
+
+    Raises:
+        RuntimeError: If the API request fails.
+
+    Returns:
+        List[List[float]]: The predicted actions from the FalconVLA API.
+    """
+    base = (falconvla_url or DEFAULT_FALCONVLA_URL).rstrip("/")
+    url = f"{base}{DEFAULT_FALCONVLA_PREDICT_PATH}"
+    if image_b64 is None and image_path is not None:
+        image_b64 = _encode_image_path_to_b64(image_path)
+    payload = PredictPayload(
+        instruction=instruction,
+        image=image_b64 or "",
+        horizon=horizon,
+    )
+    try:
+        r = requests.post(url, json=payload.model_dump(), timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("actions")
+    except Exception as e:
+        raise RuntimeError(f"FalconVLA predict request failed: {e}")
 
 
 # ==========================
@@ -524,7 +540,7 @@ async def reset_task(new_cfg: Optional[Dict[str, Any]] = None):
 
 
 @app.post("/libero/run/step", response_model=StepBatchResponse)
-async def run_episode(req: StepBatchRequest):
+async def run_step(req: StepBatchRequest):
     global STEP_COUNT, DONE, LAST_INFO, EPISODE_IDX
     global CONFIG, ENV_NAME, TASK_ID
     images: List[ImageItem] = []
@@ -550,7 +566,7 @@ async def run_episode(req: StepBatchRequest):
 
     if not actions_sequence:
         # fetch from FalconVLA (network IO) without holding ENV_LOCK
-        actions_sequence = await fetch_actions_from_falconvla(req.horizon, ctx_info)
+        actions_sequence = await falconvla_predict(req.horizon, ctx_info)
 
     # Ensure there are at least 'horizon' actions
     if len(actions_sequence) < req.horizon:
@@ -604,12 +620,13 @@ async def run_episode(req: StepBatchRequest):
 
 
 @app.post("/libero/run/episode", response_model=EpisodeBatchResponse)
-async def run_step(req: EpisodeBatchRequest):
-    global STEP_COUNT, DONE, LAST_INFO
+async def run_episode(req: EpisodeBatchRequest):
+    global STEP_COUNT, DONE, LAST_INFO, LAST_OBS
     images: List[ImageItem] = []
     rewards: List[float] = []
     infos: List[Dict[str, Any]] = []
     total_steps_taken = 0
+    instruction = req.instruction
 
     async with ENV_LOCK:
         global TASK_ID, TASK_SUITE, EPISODE_IDX
@@ -632,12 +649,16 @@ async def run_step(req: EpisodeBatchRequest):
         if STOP_ON_DONE and DONE:
             reset_if_done()
 
+        obs = ENV.step([0.0]*7)[0]  # Dummy step to get current obs
         # Loop through the episode max steps
         for ep_step in range(CONFIG["max_steps"]):
             # Get the action from FalconVLA without holding ENV_LOCK
-            actions_sequence = await fetch_actions_from_falconvla(
-                instruction="Complete the task as efficiently as possible.",
-                obs=LAST_INFO
+            image_b64 = encode_png_b64(
+                rotate_image(obs['agentview_image'], 180)
+                )
+            actions_sequence = falconvla_predict(
+                instruction=instruction,
+                image_b64=image_b64
             )
             # Loop through the action sequence
             for action_idx in range(req.horizon):
@@ -684,4 +705,10 @@ async def run_step(req: EpisodeBatchRequest):
 
 
 # Run: uvicorn server_single:app --host 0.0.0.0 --port 8000 --reload
-uvicorn.run(app, host="0.0.0.0", port=8088)
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the server on")
+    parser.add_argument("--port", type=int, default=8088, help="Port to run the server on")
+    args = parser.parse_args()
+    uvicorn.run(app, host=args.host, port=args.port)

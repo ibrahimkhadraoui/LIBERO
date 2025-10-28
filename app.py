@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import base64
 import io
-import httpx
 import requests
 import numpy as np
 import asyncio

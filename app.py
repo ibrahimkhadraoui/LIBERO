@@ -51,6 +51,23 @@ class Action(BaseModel):
     actions: List[float]
 
 
+class ImageItem(BaseModel):
+    step_index: int
+    image_b64_png: str
+
+
+class SingleActionRequest(BaseModel):
+    action: List[float]
+
+
+class SingleActionResponse(BaseModel):
+    image: ImageItem
+    reward: float
+    done: bool
+    step_count: int
+    info: Dict[str, Any]
+
+
 class StepBatchRequest(BaseModel):
     # Accept flexible action payloads: single flat list,
     # list of lists, or list of Action objects
@@ -67,9 +84,7 @@ class EpisodeBatchRequest(BaseModel):
     capture_every: int = Field(1, ge=1)
 
 
-class ImageItem(BaseModel):
-    step_index: int
-    image_b64_png: str
+
 
 
 class StepBatchResponse(BaseModel):
@@ -538,16 +553,9 @@ async def reset_task(new_cfg: Optional[Dict[str, Any]] = None):
     return {"ok": True, "max_steps": CONFIG["max_steps"]}
 
 
-@app.post("/libero/run/step", response_model=StepBatchResponse)
-async def run_step(req: StepBatchRequest):
-    global STEP_COUNT, DONE, LAST_INFO, EPISODE_IDX
-    global CONFIG, ENV_NAME, TASK_ID
-    images: List[ImageItem] = []
-    rewards: List[float] = []
-    infos: List[Dict[str, Any]] = []
-    total_steps_taken = 0
-
-    # 1) Light-weight validation + optional auto-reset (hold lock briefly)
+@app.post("/libero/run/single_action", response_model=SingleActionResponse)
+async def run_single_action(req: SingleActionRequest):
+    global STEP_COUNT, DONE, LAST_INFO, LAST_OBS
     async with ENV_LOCK:
         if ENV is None:
             raise HTTPException(status_code=400, detail="Env not initialized. Call /init first.")
@@ -555,152 +563,34 @@ async def run_step(req: StepBatchRequest):
             raise HTTPException(status_code=400, detail="Task suite not initialized. Call /init first.")
         if STOP_ON_DONE and DONE:
             reset_if_done()
-        # capture context to send to FalconVLA (do not hold lock while calling external service)
-        ctx_info = LAST_INFO
 
-    # 2) Determine actions sequence: either client-provided or fetched from FalconVLA
-    actions_sequence = req.actions
-    if len(actions_sequence) > 0 and isinstance(actions_sequence[0], (int, float)):
-        actions_sequence = [actions_sequence]
+        out = ENV.step(req.action)
+        obs, reward, done, info = out
 
-    if not actions_sequence:
-        # fetch from FalconVLA (network IO) without holding ENV_LOCK
-        actions_sequence = await falconvla_predict(req.horizon, ctx_info)
-
-    # Ensure there are at least 'horizon' actions
-    if len(actions_sequence) < req.horizon:
-        if len(actions_sequence) == 0:
-            actions_sequence = [[0.0] * 7] * req.horizon
-        else:
-            actions_sequence = (actions_sequence * ((req.horizon // len(actions_sequence)) + 1))[:req.horizon]
-
-    # 3) Execute steps; acquire ENV_LOCK only around the env.step() + state updates
-    for action_idx in range(req.horizon):
-        if DONE:
-            break
-
-        action = actions_sequence[action_idx]
-
-        async with ENV_LOCK:
-            out = ENV.step(action)
-            obs, reward, done, info = out
-
-            STEP_COUNT += 1
-            total_steps_taken += 1
-            LAST_INFO = info
-            rewards.append(float(reward))
-            infos.append(info)
-
-            if (STEP_COUNT % req.capture_every) == 0:
-                frame = obs['agentview_image']
-                frame = rotate_image(frame, 180)
-                save_img_to_disk(frame, STEP_COUNT)
-                images.append(
-                    ImageItem(
-                        step_index=STEP_COUNT,
-                        image_b64_png=encode_png_b64(frame)
-                    )
-                )
-
-            # termination checks
-            DONE = DONE or bool(done)
-            check_episode_end()
-            if req.stop_on_done and DONE:
-                break
-
-    return StepBatchResponse(
-        images=images,
-        rewards=rewards,
-        infos=infos,
-        total_steps_taken=total_steps_taken,
-        step_count=STEP_COUNT,
-        done=DONE,
-    )
-
-
-@app.post("/libero/run/episode", response_model=EpisodeBatchResponse)
-async def run_episode(req: EpisodeBatchRequest):
-    global STEP_COUNT, DONE, LAST_INFO, LAST_OBS
-    images: List[ImageItem] = []
-    rewards: List[float] = []
-    infos: List[Dict[str, Any]] = []
-    total_steps_taken = 0
-    instruction = req.instruction
-
-    async with ENV_LOCK:
-        global TASK_ID, TASK_SUITE, EPISODE_IDX
-
-        if ENV is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Env not initialized. Call /init first."
-                )
-
-        # Ensure task suite is valid
-        if TASK_SUITE is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Task suite not initialized. Call /init first."
-            )
-
-        # If episode ended and client asked to auto-reset,
-        # do it here (still under ENV_LOCK)
-        if STOP_ON_DONE and DONE:
-            reset_if_done()
-
-        obs = ENV.step([0.0]*7)[0]  # Dummy step to get current obs
-        # Loop through the episode max steps
-        for ep_step in range(CONFIG["max_steps"]):
-            # Get the action from FalconVLA without holding ENV_LOCK
-            image_b64 = encode_png_b64(
-                rotate_image(obs['agentview_image'], 180)
-                )
-            actions_sequence = falconvla_predict(
-                instruction=instruction,
-                image_b64=image_b64
-            )
-            # Loop through the action sequence
-            for action_idx in range(req.horizon):
-                if DONE:
-                    break
-                # One step in the LIBERO env
-                out = ENV.step(actions_sequence[action_idx])
-                # Unpack the output of the env after the step
-                obs, reward, done, info = out
-
-                STEP_COUNT += 1
-                total_steps_taken += 1
-                LAST_INFO = info
-                rewards.append(float(reward))
-                infos.append(info)
-
-                if (STEP_COUNT % req.capture_every) == 0:
-                    frame = obs['agentview_image']
-                    # Flip the image 180 degrees for correct orientation
-                    # LIBERO env camera is upside-down
-                    frame = rotate_image(frame, 180)
-                    save_img_to_disk(frame, STEP_COUNT)
-                    images.append(
-                        ImageItem(
-                            step_index=STEP_COUNT,
-                            image_b64_png=encode_png_b64(frame)
-                            )
-                        )
-
-                # termination checks
-                DONE = DONE or bool(done)
-                check_episode_end()
-                if req.stop_on_done and DONE:
-                    break
-
-        return EpisodeBatchResponse(
-            images=images,
-            rewards=rewards,
-            infos=infos,
-            total_steps_taken=total_steps_taken,
-            step_count=STEP_COUNT,
-            done=DONE,
+        # Flip the image 180 degrees for correct orientation
+        # LIBERO env camera is upside-down
+        frame = rotate_image(obs['agentview_image'], 180)
+        image_b64 = encode_png_b64(frame)
+        image_item = ImageItem(
+            step_index=STEP_COUNT,
+            image_b64_png=image_b64
         )
+
+        STEP_COUNT += 1
+        LAST_INFO = info
+        LAST_OBS = obs
+
+        # termination checks
+        DONE = DONE or bool(done)
+        check_episode_end()
+
+    return SingleActionResponse(
+        image=image_item,
+        reward=float(reward),
+        done=DONE,
+        step_count=STEP_COUNT,
+        info=info
+    )
 
 
 # Run: uvicorn server_single:app --host 0.0.0.0 --port 8000 --reload
